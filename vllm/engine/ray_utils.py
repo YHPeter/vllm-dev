@@ -38,6 +38,7 @@ def get_open_port():
         s.bind(("", 0))
         return s.getsockname()[1]
 
+import os
 
 def initialize_cluster(
     parallel_config: ParallelConfig,
@@ -65,7 +66,8 @@ def initialize_cluster(
                 "Ray is not installed. Please install Ray to use distributed "
                 "serving.")
         # Connect to a ray cluster.
-        ray.init(address=ray_address, ignore_reinit_error=True)
+        ray.init(address=ray_address, ignore_reinit_error=True, num_cpus = len(os.sched_getaffinity(0)))
+        # int(os.environ.get('SLURM_CPUS_PER_TASK'))
 
     if not parallel_config.worker_use_ray:
         # Initialize cluster locally.

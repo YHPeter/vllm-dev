@@ -179,7 +179,7 @@ async def create_chat_completion(raw_request: Request):
         - logit_bias (to be supported by vLLM engine)
     """
     request = ChatCompletionRequest(**await raw_request.json())
-    logger.info(f"Received chat completion request: {request}")
+    # logger.info(f"Received chat completion request: {request}")
 
     error_check_ret = await check_model(request)
     if error_check_ret is not None:
@@ -278,13 +278,13 @@ async def create_chat_completion(raw_request: Request):
         yield "data: [DONE]\n\n"
 
     # Streaming response
-    if request.stream:
-        background_tasks = BackgroundTasks()
-        # Abort the request if the client disconnects.
-        background_tasks.add_task(abort_request)
-        return StreamingResponse(completion_stream_generator(),
-                                 media_type="text/event-stream",
-                                 background=background_tasks)
+    # if request.stream:
+    #     background_tasks = BackgroundTasks()
+    #     # Abort the request if the client disconnects.
+    #     background_tasks.add_task(abort_request)
+    #     return StreamingResponse(completion_stream_generator(),
+    #                              media_type="text/event-stream",
+    #                              background=background_tasks)
 
     # Non-streaming response
     final_res: RequestOutput = None
@@ -303,6 +303,7 @@ async def create_chat_completion(raw_request: Request):
             message=ChatMessage(role="assistant", content=output.text),
             finish_reason=output.finish_reason,
         )
+        print(choice_data)
         choices.append(choice_data)
 
     num_prompt_tokens = len(final_res.prompt_token_ids)
@@ -321,18 +322,18 @@ async def create_chat_completion(raw_request: Request):
         usage=usage,
     )
 
-    if request.stream:
-        # When user requests streaming but we don't stream, we still need to
-        # return a streaming response with a single event.
-        response_json = response.json(ensure_ascii=False)
+    # if request.stream:
+    #     # When user requests streaming but we don't stream, we still need to
+    #     # return a streaming response with a single event.
+    #     response_json = response.json(ensure_ascii=False)
 
-        async def fake_stream_generator() -> AsyncGenerator[str, None]:
-            yield f"data: {response_json}\n\n"
-            yield "data: [DONE]\n\n"
+    #     async def fake_stream_generator() -> AsyncGenerator[str, None]:
+    #         yield f"data: {response_json}\n\n"
+    #         yield "data: [DONE]\n\n"
 
-        return StreamingResponse(fake_stream_generator(),
-                                 media_type="text/event-stream")
-
+    #     return StreamingResponse(fake_stream_generator(),
+    #                              media_type="text/event-stream")
+    logger.info(f"Returning completion response: {response} {choices[0].message.content}")
     return response
 
 
@@ -351,7 +352,7 @@ async def create_completion(raw_request: Request):
         - logit_bias (to be supported by vLLM engine)
     """
     request = CompletionRequest(**await raw_request.json())
-    logger.info(f"Received completion request: {request}")
+    # logger.info(f"Received completion request: {request}")
 
     error_check_ret = await check_model(request)
     if error_check_ret is not None:
@@ -534,6 +535,7 @@ async def create_completion(raw_request: Request):
         return StreamingResponse(fake_stream_generator(),
                                  media_type="text/event-stream")
 
+    logger.info(f"Returning completion response: {response} {choices[0]}")
     return response
 
 

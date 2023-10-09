@@ -22,6 +22,7 @@ def hf_model_weights_iterator(
     cache_dir: Optional[str] = None,
     use_np_cache: bool = False,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
+    cache_dir = "/network/scratch/h/hao.yu/.cache/huggingface"
     # Prepare file lock directory to prevent multiple processes from
     # downloading the same model weights at the same time.
     lock_dir = cache_dir if cache_dir is not None else "/tmp"
@@ -35,7 +36,8 @@ def hf_model_weights_iterator(
             hf_folder = snapshot_download(model_name_or_path,
                                           allow_patterns="*.bin",
                                           cache_dir=cache_dir,
-                                          tqdm_class=Disabledtqdm)
+                                          tqdm_class=Disabledtqdm,
+                                          use_auth_token=True)
     else:
         hf_folder = model_name_or_path
 
