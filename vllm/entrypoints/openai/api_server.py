@@ -3,18 +3,18 @@
 
 import argparse
 import asyncio
-from http import HTTPStatus
 import json
 import time
-from typing import AsyncGenerator, Dict, List, Optional
-from packaging import version
+from http import HTTPStatus
+from typing import AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import fastapi
-from fastapi import BackgroundTasks, Request
+import uvicorn
+from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-import uvicorn
+from packaging import version
 
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
@@ -44,6 +44,7 @@ TIMEOUT_KEEP_ALIVE = 5  # seconds
 logger = init_logger(__name__)
 served_model = None
 app = fastapi.FastAPI()
+engine = None
 
 
 def create_error_response(status_code: HTTPStatus,
@@ -115,12 +116,24 @@ async def get_gen_prompt(request) -> str:
     return prompt
 
 
-async def check_length(request, prompt):
-    input_ids = tokenizer(prompt).input_ids
+async def check_length(
+    request: Union[ChatCompletionRequest, CompletionRequest],
+    prompt: Optional[str] = None,
+    prompt_ids: Optional[List[int]] = None
+) -> Tuple[List[int], Optional[JSONResponse]]:
+    assert (not (prompt is None and prompt_ids is None)
+            and not (prompt is not None and prompt_ids is not None)
+            ), "Either prompt or prompt_ids should be provided."
+    if prompt_ids is not None:
+        input_ids = prompt_ids
+    else:
+        input_ids = tokenizer(prompt).input_ids
     token_num = len(input_ids)
 
+    if request.max_tokens is None:
+        request.max_tokens = max_model_len - token_num
     if token_num + request.max_tokens > max_model_len:
-        return create_error_response(
+        return input_ids, create_error_response(
             HTTPStatus.BAD_REQUEST,
             f"This model's maximum context length is {max_model_len} tokens. "
             f"However, you requested {request.max_tokens + token_num} tokens "
@@ -129,7 +142,7 @@ async def check_length(request, prompt):
             f"Please reduce the length of the messages or completion.",
         )
     else:
-        return None
+        return input_ids, None
 
 
 @app.get("/v1/models")
@@ -168,7 +181,8 @@ def create_logprobs(token_ids: List[int],
 
 
 @app.post("/v1/chat/completions")
-async def create_chat_completion(raw_request: Request):
+async def create_chat_completion(request: ChatCompletionRequest,
+                                 raw_request: Request):
     """Completion API similar to OpenAI's API.
 
     See  https://platform.openai.com/docs/api-reference/chat/create
@@ -178,26 +192,25 @@ async def create_chat_completion(raw_request: Request):
         - function_call (Users should implement this by themselves)
         - logit_bias (to be supported by vLLM engine)
     """
-    request = ChatCompletionRequest(**await raw_request.json())
-    # logger.info(f"Received chat completion request: {request}")
+    logger.info(f"Received chat completion request: {request}")
 
     error_check_ret = await check_model(request)
     if error_check_ret is not None:
         return error_check_ret
 
-    if request.logit_bias is not None:
+    if request.logit_bias is not None and len(request.logit_bias) > 0:
         # TODO: support logit_bias in vLLM engine.
         return create_error_response(HTTPStatus.BAD_REQUEST,
                                      "logit_bias is not currently supported")
 
     prompt = await get_gen_prompt(request)
-    error_check_ret = await check_length(request, prompt)
+    token_ids, error_check_ret = await check_length(request, prompt=prompt)
     if error_check_ret is not None:
         return error_check_ret
 
     model_name = request.model
     request_id = f"cmpl-{random_uuid()}"
-    created_time = int(time.time())
+    created_time = int(time.monotonic())
     try:
         sampling_params = SamplingParams(
             n=request.n,
@@ -206,19 +219,19 @@ async def create_chat_completion(raw_request: Request):
             temperature=request.temperature,
             top_p=request.top_p,
             stop=request.stop,
+            stop_token_ids=request.stop_token_ids,
             max_tokens=request.max_tokens,
             best_of=request.best_of,
             top_k=request.top_k,
             ignore_eos=request.ignore_eos,
             use_beam_search=request.use_beam_search,
+            skip_special_tokens=request.skip_special_tokens,
         )
     except ValueError as e:
         return create_error_response(HTTPStatus.BAD_REQUEST, str(e))
 
-    result_generator = engine.generate(prompt, sampling_params, request_id)
-
-    async def abort_request() -> None:
-        await engine.abort(request_id)
+    result_generator = engine.generate(prompt, sampling_params, request_id,
+                                       token_ids)
 
     def create_stream_response_json(
         index: int,
@@ -278,20 +291,16 @@ async def create_chat_completion(raw_request: Request):
         yield "data: [DONE]\n\n"
 
     # Streaming response
-    # if request.stream:
-    #     background_tasks = BackgroundTasks()
-    #     # Abort the request if the client disconnects.
-    #     background_tasks.add_task(abort_request)
-    #     return StreamingResponse(completion_stream_generator(),
-    #                              media_type="text/event-stream",
-    #                              background=background_tasks)
+    if request.stream:
+        return StreamingResponse(completion_stream_generator(),
+                                 media_type="text/event-stream")
 
     # Non-streaming response
     final_res: RequestOutput = None
     async for res in result_generator:
         if await raw_request.is_disconnected():
             # Abort the request if the client disconnects.
-            await abort_request()
+            await engine.abort(request_id)
             return create_error_response(HTTPStatus.BAD_REQUEST,
                                          "Client disconnected")
         final_res = res
@@ -338,7 +347,7 @@ async def create_chat_completion(raw_request: Request):
 
 
 @app.post("/v1/completions")
-async def create_completion(raw_request: Request):
+async def create_completion(request: CompletionRequest, raw_request: Request):
     """Completion API similar to OpenAI's API.
 
     See https://platform.openai.com/docs/api-reference/completions/create
@@ -351,8 +360,7 @@ async def create_completion(raw_request: Request):
           suffix)
         - logit_bias (to be supported by vLLM engine)
     """
-    request = CompletionRequest(**await raw_request.json())
-    # logger.info(f"Received completion request: {request}")
+    logger.info(f"Received completion request: {request}")
 
     error_check_ret = await check_model(request)
     if error_check_ret is not None:
@@ -369,25 +377,42 @@ async def create_completion(raw_request: Request):
         return create_error_response(HTTPStatus.BAD_REQUEST,
                                      "suffix is not currently supported")
 
-    if request.logit_bias is not None:
+    if request.logit_bias is not None and len(request.logit_bias) > 0:
         # TODO: support logit_bias in vLLM engine.
         return create_error_response(HTTPStatus.BAD_REQUEST,
                                      "logit_bias is not currently supported")
 
     model_name = request.model
     request_id = f"cmpl-{random_uuid()}"
+
+    use_token_ids = False
     if isinstance(request.prompt, list):
         if len(request.prompt) == 0:
             return create_error_response(HTTPStatus.BAD_REQUEST,
                                          "please provide at least one prompt")
-        if len(request.prompt) > 1:
-            return create_error_response(
-                HTTPStatus.BAD_REQUEST,
-                "multiple prompts in a batch is not currently supported")
-        prompt = request.prompt[0]
+        first_element = request.prompt[0]
+        if isinstance(first_element, int):
+            use_token_ids = True
+            prompt = request.prompt
+        elif isinstance(first_element, (str, list)):
+            # TODO: handles multiple prompt case in list[list[int]]
+            if len(request.prompt) > 1:
+                return create_error_response(
+                    HTTPStatus.BAD_REQUEST,
+                    "multiple prompts in a batch is not currently supported")
+            use_token_ids = not isinstance(first_element, str)
+            prompt = request.prompt[0]
     else:
         prompt = request.prompt
-    created_time = int(time.time())
+
+    if use_token_ids:
+        _, error_check_ret = await check_length(request, prompt_ids=prompt)
+    else:
+        token_ids, error_check_ret = await check_length(request, prompt=prompt)
+    if error_check_ret is not None:
+        return error_check_ret
+
+    created_time = int(time.monotonic())
     try:
         sampling_params = SamplingParams(
             n=request.n,
@@ -398,24 +423,30 @@ async def create_completion(raw_request: Request):
             top_p=request.top_p,
             top_k=request.top_k,
             stop=request.stop,
+            stop_token_ids=request.stop_token_ids,
             ignore_eos=request.ignore_eos,
             max_tokens=request.max_tokens,
             logprobs=request.logprobs,
             use_beam_search=request.use_beam_search,
+            skip_special_tokens=request.skip_special_tokens,
         )
     except ValueError as e:
         return create_error_response(HTTPStatus.BAD_REQUEST, str(e))
 
-    result_generator = engine.generate(prompt, sampling_params, request_id)
+    if use_token_ids:
+        result_generator = engine.generate(None,
+                                           sampling_params,
+                                           request_id,
+                                           prompt_token_ids=prompt)
+    else:
+        result_generator = engine.generate(prompt, sampling_params, request_id,
+                                           token_ids)
 
     # Similar to the OpenAI API, when n != best_of, we do not stream the
     # results. In addition, we do not stream the results when use beam search.
     stream = (request.stream
               and (request.best_of is None or request.n == request.best_of)
               and not request.use_beam_search)
-
-    async def abort_request() -> None:
-        await engine.abort(request_id)
 
     def create_stream_response_json(
         index: int,
@@ -476,19 +507,15 @@ async def create_completion(raw_request: Request):
 
     # Streaming response
     if stream:
-        background_tasks = BackgroundTasks()
-        # Abort the request if the client disconnects.
-        background_tasks.add_task(abort_request)
         return StreamingResponse(completion_stream_generator(),
-                                 media_type="text/event-stream",
-                                 background=background_tasks)
+                                 media_type="text/event-stream")
 
     # Non-streaming response
     final_res: RequestOutput = None
     async for res in result_generator:
         if await raw_request.is_disconnected():
             # Abort the request if the client disconnects.
-            await abort_request()
+            await engine.abort(request_id)
             return create_error_response(HTTPStatus.BAD_REQUEST,
                                          "Client disconnected")
         final_res = res
@@ -542,10 +569,7 @@ async def create_completion(raw_request: Request):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="vLLM OpenAI-Compatible RESTful API server.")
-    parser.add_argument("--host",
-                        type=str,
-                        default="localhost",
-                        help="host name")
+    parser.add_argument("--host", type=str, default=None, help="host name")
     parser.add_argument("--port", type=int, default=8000, help="port number")
     parser.add_argument("--allow-credentials",
                         action="store_true",
@@ -590,7 +614,7 @@ if __name__ == "__main__":
     engine_args = AsyncEngineArgs.from_cli_args(args)
     engine = AsyncLLMEngine.from_engine_args(engine_args)
     engine_model_config = asyncio.run(engine.get_model_config())
-    max_model_len = engine_model_config.get_max_model_len()
+    max_model_len = engine_model_config.max_model_len
 
     # A separate tokenizer to map token IDs to strings.
     tokenizer = get_tokenizer(engine_args.tokenizer,
